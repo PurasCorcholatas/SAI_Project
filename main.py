@@ -1,7 +1,7 @@
 from dotenv import load_dotenv
 load_dotenv()
 from fastapi import FastAPI
-from router.router import user, chat, test_usuarios
+from router.router import user, chat, test_usuarios, telegram_router
 
 
 app = FastAPI()
@@ -10,7 +10,7 @@ app.include_router(user)
 
 app.include_router(chat, prefix="/api")
 app.include_router(test_usuarios, prefix="/api")
-
+app.include_router(telegram_router)
 app.include_router(chat)
 
 @app.get("/")

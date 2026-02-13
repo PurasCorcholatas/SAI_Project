@@ -1,14 +1,9 @@
-
 from fastapi import APIRouter, Query, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import select
-
-from fastapi import APIRouter
-
 from pydantic import BaseModel
 from langchain_core.messages import AIMessage
 from graph.graph import graph  
-
 
 from config.db import engine, get_db
 from schema.faq_schema import Faq_Schema
@@ -18,18 +13,29 @@ from services.embedding_service import buscar_faq
 from services.chat_service import procesar_mensaje
 from graph.service import chat_sai
 
+import os
+import httpx
 
 
 user = APIRouter()
 chat = APIRouter()
 test_usuarios = APIRouter()
+telegram_router = APIRouter()  
 
+
+CHATWOOT_URL = os.getenv("CHATWOOT_URL")
+ACCOUNT_ID = os.getenv("CHATWOOT_ACCOUNT_ID")
+API_TOKEN = os.getenv("CHATWOOT_API_TOKEN")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+
+
+chatwoot_conversations = {}
 
 
 @user.get("/")
 def root():
     return {"status": "ok"}
-
 
 @user.post("/api/faq")
 def create_faq(data_faq: Faq_Schema):
@@ -37,25 +43,18 @@ def create_faq(data_faq: Faq_Schema):
         conn.execute(faq.insert().values(data_faq.dict()))
     return {"success": True}
 
-
 @user.get("/api/faq/buscar")
 def faq_usuario(texto: str = Query(...)):
     respuesta = buscar_faq(texto)
     return {"usuario": texto, "respuesta": respuesta}
 
 
-chat = APIRouter()
-user = APIRouter()
-
-
 class ChatRequest(BaseModel):
     message: str
     session_id: str
 
-
 class ChatResponse(BaseModel):
     answer: str
-
 
 def serialize_messages(messages):
     serialized = []
@@ -68,59 +67,146 @@ def serialize_messages(messages):
             serialized.append({"content": str(m)})
     return serialized
 
-
-
-
-
-
-def route_chat(state):
-    text = state["messages"][-1].content.lower()
-
-    faq_keywords = [
-        "registro", "inscripción", "horario",
-        "nota", "materia", "docente", "semestre"
-    ]
-
-    if any(k in text for k in faq_keywords):
-        return "rag"
-
-    return "chat"
-
-
-
 @test_usuarios.get("/test/usuarios")
 def get_test_usuarios(db: Session = Depends(get_db)):
     stmt = select(usuarios)
     result = db.execute(stmt).fetchall()
-
     return {
         "total": len(result),
         "usuarios": [dict(row._mapping) for row in result]
     }
 
-
 @chat.post("/chat", response_model=ChatResponse)
-def chat_endpoint(payload: ChatRequest, db: Session = Depends(get_db)):
+def chat_endpoint(payload: ChatRequest):
+    try:
+        state = {
+            "messages": [{"role": "user", "content": payload.message}],
+            "intent": "general",
+            "context": "",
+        }
 
+        result = graph.invoke(
+            state,
+            config={
+                "configurable": {
+                    "thread_id": payload.session_id  
+                }
+            }
+        )
+
+        messages = result.get("messages", [])
+        if not messages:
+            return {"answer": "No se pudo generar respuesta."}
+
+        answer = messages[-1].content
+        return {"answer": answer}
+
+    except Exception as e:
+        return {"answer": "Error interno del servidor."}
+
+
+async def enviar_mensaje_telegram(chat_id: str, texto: str):
+    """Enviar mensaje al chat de Telegram"""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            TELEGRAM_API_URL,
+            json={
+                "chat_id": chat_id,
+                "text": texto
+            }
+        )
+
+
+async def obtener_conversation_id(chat_id: str):
+    """Devuelve el conversation_id de Chatwoot para un chat_id de Telegram.
+    Si no existe, lo crea."""
+    async with httpx.AsyncClient() as client:
+        if chat_id in chatwoot_conversations:
+            return chatwoot_conversations[chat_id]
+
+       
+        response = await client.post(
+            f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations",
+            headers={"api_access_token": API_TOKEN},
+            json={
+                "source_id": chat_id,  
+                "inbox_id": 1,  
+                "contact": {"name": f"Telegram_{chat_id}"}
+            }
+        )
+        data = response.json()
+        conversation_id = data.get("id")
+        chatwoot_conversations[chat_id] = conversation_id
+        return conversation_id
+
+
+@telegram_router.post("/telegram/webhook")
+async def telegram_webhook(payload: dict):
+    """Webhook para recibir mensajes de Telegram, responder con LangGraph y guardar todo en Chatwoot."""
+    message_data = payload.get("message")
+    if not message_data:
+        return {"status": "ignored"}
+
+    chat_id = message_data["chat"]["id"]
+    user_message = message_data.get("text", "")
+
+    
     state = {
-        "messages": [{"role": "user", "content": payload.message}],
+        "messages": [{"role": "user", "content": user_message}],
         "intent": "general",
-        "context": "",
+        "context": ""
     }
 
+    
     result = graph.invoke(
-    state,
-    config={
-        "configurable": {
-            "thread_id": payload.session_id
-        }
+        state,
+        config={
+            "configurable": {"thread_id": str(chat_id)}
         }
     )
 
-
     messages = result.get("messages", [])
-    answer = messages[-1].content if messages else "No se pudo generar respuesta."
+    bot_response = messages[-1].content if messages else "No se pudo generar respuesta."
 
-    return {"answer": answer}
+    
+    await enviar_mensaje_telegram(chat_id, bot_response)
 
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            
+            if chat_id not in chatwoot_conversations:
+                response = await client.post(
+                    f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations",
+                    headers={"api_access_token": API_TOKEN},
+                    json={
+                        "source_id": chat_id,
+                        "inbox_id": 1,  
+                        "contact": {"name": f"Telegram_{chat_id}"}
+                    }
+                )
+                data = response.json()
+                conversation_id = data.get("id")
+                chatwoot_conversations[chat_id] = conversation_id
+            else:
+                conversation_id = chatwoot_conversations[chat_id]
+
+            
+            await client.post(
+                f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages",
+                headers={"api_access_token": API_TOKEN},
+                json={"content": user_message, "message_type": "incoming"}
+            )
+
+            
+            await client.post(
+                f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages",
+                headers={"api_access_token": API_TOKEN},
+                json={"content": bot_response, "message_type": "outgoing"}
+            )
+
+    except Exception as e:
+        print("Error sincronizando con Chatwoot:", e)
+
+    return {"status": "ok"}
 

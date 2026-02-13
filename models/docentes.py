@@ -8,7 +8,7 @@ docentes = Table(
     "docentes",
     meta_data,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("id_usuario", String(100),ForeignKey("usuarios.id"), nullable=False),
+    Column("id_usuario", String(100), nullable=False),
     Column("especialidad", String(120), nullable=False, unique=True),
     Column("tipo_contrato", String(255), nullable=False),
     Column(

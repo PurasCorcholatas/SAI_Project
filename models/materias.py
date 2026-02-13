@@ -4,6 +4,8 @@ from sqlalchemy import (
 )
 from config.db import meta_data, engine
 
+meta_data.clear()
+
 materias = Table(
     "materias",
     meta_data,
@@ -12,11 +14,7 @@ materias = Table(
     Column("nombre", String(120), nullable=False, unique=True),
     Column("creditos", String(255), nullable=False),
     Column("id_programa", Integer, ForeignKey("programa.id"), nullable=False),
-    Column(
-        "estado",
-        Enum("activo", "inactivo", name="estado_docente"),
-        default="activo"
-    ),
+    
     
    
 )

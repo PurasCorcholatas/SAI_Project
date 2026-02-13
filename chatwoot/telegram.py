@@ -1,54 +1,59 @@
-# import requests
-# from telegram import Update
-# # from Telegram.ext import (
-#     ApplicationBuilder,
-#     CommandHandler,
-#     MessageHandler,
-#     ContextTypes,
-#     filters,
-# )
+import httpx
+from telegram import Update
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    ContextTypes,
+    filters,
+)
 
-# TOKEN = "8475804694:AAHbJ2IRmhn4_OfkA9T_97WGMMLaWy-_xB8"
-# API_URL = "http://127.0.0.1:8000/chat"  
-
-
-# async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     await update.message.reply_text(
-#         "Hola! Soy el Soporte de ayuda de SAI Serviunix. ¿En qué puedo ayudarte?"
-#     )
+TOKEN = "TU_TOKEN"
+API_URL = "http://127.0.0.1:8000/api/chat"
 
 
-# async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-#     user_message = update.message.text
-#     session_id = str(update.effective_user.id)  # importante para memoria
-
-#     try:
-#         response = requests.post(
-#             API_URL,
-#             json={
-#                 "message": user_message,
-#                 "session_id": session_id,
-#             },
-#         )
-
-#         data = response.json()
-#         answer = data.get("answer", "No se pudo generar respuesta.")
-
-#         await update.message.reply_text(answer)
-
-#     except Exception as e:
-#         await update.message.reply_text("Error conectando con el servidor.")
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hola! Soy el Soporte de ayuda de SAI. ¿En qué puedo ayudarte?"
+    )
 
 
-# def main():
-#     app = ApplicationBuilder().token(TOKEN).build()
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_message = update.message.text
+    session_id = str(update.effective_user.id)
 
-#     app.add_handler(CommandHandler("start", start))
-#     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                API_URL,
+                json={
+                    "message": user_message,
+                    "session_id": session_id,
+                },
+            )
 
-#     print("Bot corriendo...")
-#     app.run_polling()
+        if response.status_code != 200:
+            await update.message.reply_text("Error del servidor.")
+            return
+
+        data = response.json()
+        answer = data.get("answer", "No se pudo generar respuesta.")
+
+        await update.message.reply_text(answer)
+
+    except Exception:
+        await update.message.reply_text("Error conectando con el servidor.")
 
 
-# if __name__ == "__main__":
-#     main()
+def main():
+    app = ApplicationBuilder().token(TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    print("Bot corriendo...")
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
