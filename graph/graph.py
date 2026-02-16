@@ -2,12 +2,19 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage, AIMessage
 from sqlalchemy import text
 from config.db import engine
 from config.queries import obtener_docentes
-from typing import Literal, Annotated
+from typing import Literal, Annotated, Optional
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
+
+import smtplib
+from email.mime.text import MIMEText
+import os
+
+
 
 from rag.search import buscar_faq, buscar_en_embeddings
 from services.db_service import (
@@ -34,8 +41,11 @@ load_dotenv()
 
 class State(TypedDict):
     messages: Annotated[list, add_messages]
-    intent: Literal["general", "faq", "db"]
+    intent: str
     context: str
+    human_escalated: bool
+    flow_step: Optional[str]
+    collected_data: dict
 
 
 llm = ChatOpenAI(
@@ -48,23 +58,127 @@ def clean_sql(query: str) -> str:
     return re.sub(r"```sql|```", "", query, flags=re.IGNORECASE).strip()
 
 
+
+
+
+def get_last_message_content(state: State):
+    last = state["messages"][-1]
+
+    if isinstance(last, dict):
+        return last["content"]
+    else:
+        return last.content
+
+
+
+
+
 def router(state: State):
-    last_message = state["messages"][-1].content
+    last_message = get_last_message_content(state)
+
+
     prompt = f"""
 Clasifica la intención del mensaje del usuario.
-Responde SOLO con una palabra:
+Responde SOLO con una palabra exacta:
 
-- faq → preguntas frecuentes académicas
-- db → consultas sobre datos del sistema
+- human → quiere hablar con una persona real
+- matricula → quiere matricularse
+- buscar_correo → olvidó su correo registrado
+- faq → pregunta frecuente académica
+- db_docentes → consulta sobre docentes
+- db_cursos → consulta sobre cursos
 - general → conversación normal
 
 Mensaje:
 "{last_message}"
 """
+
     intent = llm.invoke(prompt).content.strip().lower()
-    if intent not in ["general", "faq", "db"]:
+
+    valid_intents = [
+        "human",
+        "matricula",
+        "buscar_correo",
+        "faq",
+        "db_docentes",
+        "db_cursos",
+        "general"
+    ]
+
+    if intent not in valid_intents:
         intent = "general"
-    return {"intent": intent}
+
+    return {
+        "intent": intent,
+        "human_escalated": False,
+        "flow_step": "",
+        "collected_data": {}
+    }
+
+
+
+def generar_resumen_conversacion(state: State) -> str:
+    mensajes = []
+    for m in state['messages']:
+        # m puede ser dict o HumanMessage/AIMessage, usa get_last_message_content similar:
+        if isinstance(m, dict):
+            mensajes.append(m.get("content", ""))
+        else:
+            mensajes.append(m.content)
+
+    prompt = f"""
+    Resumir la siguiente conversación de manera clara y breve para que un humano pueda entender el contexto sin leer cada mensaje literal:
+
+    Mensajes:
+    {mensajes}
+
+    Resumen:
+    """
+    resumen = llm.invoke(prompt).content.strip()
+    return resumen
+
+
+
+
+def enviar_correo_escalamiento(state: State, chatwoot_link: str):
+    resumen = generar_resumen_conversacion(state)
+
+    cuerpo = f"""
+Se ha solicitado atención humana.
+
+Resumen de la conversación:
+-----------------------
+{resumen}
+-----------------------
+
+Link Chatwoot:
+{chatwoot_link}
+"""
+    msg = MIMEText(cuerpo)
+    msg["Subject"] = "Nuevo caso escalado a humano - SAI"
+    msg["From"] = os.getenv("SMTP_EMAIL")
+    msg["To"] = os.getenv("DESTINO_SOPORTE")
+
+    with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT"))) as server:
+        server.starttls()
+        server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
+        server.send_message(msg)
+
+
+def escalamiento_humano(state: State):
+
+    chatwoot_link = "https://TU_CHATWOOT_URL/app/accounts/1/conversations"
+
+    enviar_correo_escalamiento(state, chatwoot_link)
+
+    return {
+        "messages": [{
+            "role": "assistant",
+            "content": "Ya he notificado a un asesor humano. En breve continuará la conversación contigo."
+        }],
+        "human_escalated": True
+    }
+
 
 def chat_general(state: State):
     response = llm.invoke(state["messages"])
@@ -233,40 +347,114 @@ Contexto:
     return {"messages": [response]}
 
 
+
+
+
+
+
+def matricula_flujo(state: State):
+
+    last_message = get_last_message_content(state)
+    flow_step = state.get("flow_step")
+    data = state.get("collected_data", {})
+
+    if flow_step == "ask_identification":
+        data["identificador"] = last_message
+
+    with engine.begin() as conn:
+        estudiante = conn.execute(
+            text("SELECT * FROM estudiantes WHERE nombre=:ident OR documento=:ident"),
+            {"ident": last_message}
+        ).fetchone()
+
+    if estudiante:
+        respuesta = f"Hola {estudiante['nombre']}, ya estás registrado. Puedes matricularte en los cursos disponibles este periodo."
+    else:
+        respuesta = "No encontré un estudiante con esos datos. Por favor verifica tu nombre o documento."
+
+    return {
+        "messages": [{"role": "assistant", "content": respuesta}],
+        "flow_step": "completed",
+        "collected_data": data
+    }
+
+
+   
+
+def buscar_correo_flujo(state: State):
+    last_message = get_last_message_content(state)
+    flow_step = state.get("flow_step")
+    data = state.get("collected_data", {})
+
+    if not flow_step:
+        # Primera interacción: preguntar por el nombre o documento
+        return {
+            "messages": [{
+                "role": "assistant",
+                "content": "Puedo ayudarte a buscar tu correo registrado. ¿Prefieres darme tu nombre completo o tu número de documento?"
+            }],
+            "flow_step": "ask_identification",
+            "collected_data": data
+        }
+
+    elif flow_step == "ask_identification":
+        # Ya tengo el dato del usuario, lo guardo y busco en DB
+        data["identificador"] = last_message.strip()
+
+        with engine.begin() as conn:
+            correo_real = conn.execute(
+                text("SELECT email FROM usuarios WHERE nombre=:ident"),
+                {"ident": data["identificador"]}
+            ).fetchone()
+
+        if correo_real:
+            correo_encontrado = correo_real[0]
+            respuesta = f"El correo registrado es: {correo_encontrado}"
+        else:
+            respuesta = "No pude encontrar un correo con esa información. Verifica que tu nombre esté correcto."
+
+        return {
+            "messages": [{"role": "assistant", "content": respuesta}],
+            "flow_step": "completed",
+            "collected_data": data
+        }
+
+
+    return {"messages": [{"role": "assistant", "content": "Continuemos."}]}
+
+
+
 builder = StateGraph(State)
 
 builder.add_node("router", router)
+builder.add_node("escalamiento_humano", escalamiento_humano)
+builder.add_node("matricula_flujo", matricula_flujo)
+builder.add_node("buscar_correo_flujo", buscar_correo_flujo)
 builder.add_node("chat_general", chat_general)
 builder.add_node("rag_faq", rag_faq)
-builder.add_node("rag_embeddings", rag_embeddings)
 builder.add_node("faq_academico", faq_academico)
-builder.add_node("db_general", db_query_general)
-builder.add_node("db_docentes", db_query_docentes)
-builder.add_node("llm_bd", llm_bd)
-builder.add_node("sql_node", sql_node)
-builder.add_node("sql_response", sql_response)
-
 
 builder.add_edge(START, "router")
+
 builder.add_conditional_edges(
     "router",
     lambda state: state["intent"],
     {
+        "human": "escalamiento_humano",
+        "matricula": "matricula_flujo",
+        "buscar_correo": "buscar_correo_flujo",
         "faq": "rag_faq",
-        "db": "db_general",
         "general": "chat_general",
     }
 )
-builder.add_edge("rag_faq", "faq_academico")
-builder.add_edge("rag_embeddings", "faq_academico")
-builder.add_edge("db_general", "llm_bd")
-builder.add_edge("faq_academico", END)
-builder.add_edge("llm_bd", END)
-builder.add_edge("chat_general", END)
-builder.add_edge("sql_node", "sql_response")
-builder.add_edge("sql_response", END)
-builder.add_edge("db_general", "chat_general")
 
-# Memory
+builder.add_edge("rag_faq", "faq_academico")
+
+builder.add_edge("faq_academico", END)
+builder.add_edge("chat_general", END)
+builder.add_edge("escalamiento_humano", END)
+builder.add_edge("matricula_flujo", END)
+builder.add_edge("buscar_correo_flujo", END)
+
 memory = MemorySaver()
 graph = builder.compile(checkpointer=memory)
