@@ -1,7 +1,6 @@
 from services.embedding_service import buscar_en_embeddings
 from services.db_service import (
     obtener_usuarios,
-    obtener_cursos,
     obtener_docentes,
     obtener_estudiantes,
     obtener_faq,
@@ -11,7 +10,6 @@ from services.db_service import (
     obtener_matriculas,
     obtener_notas,
     obtener_periodos,
-    obtener_programas,
     obtener_roles,
     obtener_solicitudes,
     
@@ -32,8 +30,6 @@ def procesar_mensaje(texto: str, db: Session):
     text_lower = texto.lower()
     if "docentes" in text_lower:
         return obtener_docentes(db)
-    elif "curso" in text_lower:
-        return obtener_cursos(db)
     elif "estudiantes" in text_lower:
         return obtener_estudiantes(db)
     elif "faq" in text_lower:
@@ -50,8 +46,6 @@ def procesar_mensaje(texto: str, db: Session):
         return obtener_notas(db)
     elif "periodos" in text_lower:
         return obtener_periodos(db)
-    elif "programas" in text_lower:
-        return obtener_programas(db)
     elif "roles" in text_lower:
         return obtener_roles(db)
     elif "solicitudes" in text_lower:

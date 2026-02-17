@@ -8,11 +8,12 @@ grupos = Table(
     "grupos",
     meta_data,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("id_materia", INT,ForeignKey("materia.id"), nullable=False),
+    Column("cupo", INT, nullable=False),
+    Column("horario", String(100), nullable=False),
+    Column("aula", String(100), nullable=False),
     Column("id_docente", INT, ForeignKey("docente.id"),  nullable=False),
     Column("id_periodo", INT,ForeignKey("periodos.id"), nullable=False),
-    Column("cupo", INT, nullable=False),
-    Column("horario", String(200), nullable=False),
+
     extend_existing=True
    
 )

@@ -11,10 +11,10 @@ from models.matricula import matriculas
 
 from models.notas import notas
 from models.periodos import periodos
-from models.programas import programas
+
 from models.roles import roles
 from models.solicitudes import solicitudes
-from models.cursos import cursos
+
 
 
 
@@ -55,9 +55,6 @@ def obtener_periodos(db: Session):
     result = db.execute(select(periodos)).fetchall()
     return [dict(r._mapping) for r in result]
 
-def obtener_programas(db: Session):
-    result = db.execute(select(programas)).fetchall()
-    return [dict(r._mapping) for r in result]
 
 def obtener_roles(db: Session):
     result = db.execute(select(roles)).fetchall()
@@ -71,6 +68,3 @@ def obtener_estudiantes(db: Session):
     result = db.execute(select(estudiantes)).fetchall()
     return [dict(r._mapping) for r in result]
 
-def obtener_cursos(db: Session):
-    result = db.execute(select(cursos)).fetchall()
-    return [dict(r._mapping) for r in result]

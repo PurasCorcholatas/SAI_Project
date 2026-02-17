@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Table, Column, Integer, String,
-    Enum, DateTime, ForeignKey
+    Enum, DateTime, ForeignKey, func
 )
 from config.db import meta_data, engine
 
@@ -20,7 +20,8 @@ usuarios = Table(
     Column(
         "creado_en",
         DateTime,
-        server_default="CURRENT_TIMESTAMP"
+            server_default=func.now(),
+            nullable=False
     ),
     extend_existing=True
 )

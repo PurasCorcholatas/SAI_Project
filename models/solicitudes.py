@@ -1,5 +1,7 @@
-from sqlalchemy import Table, Column, Integer, String, ForeignKey, Enum
+from sqlalchemy import Table, Column, Integer, String, ForeignKey, Enum,func, DateTime
 from config.db import meta_data
+
+meta_data.clear()
 
 solicitudes = Table(
     "solicitudes",
@@ -12,6 +14,10 @@ solicitudes = Table(
         "estado",
         Enum("pendiente", "aprobado","rechazada", name="estado_solicitud"),
         default="activo"
+    ),
+    Column("creado_en",DateTime,
+            server_default=func.now(),
+            nullable=False
     ),
     extend_existing=True
 )

@@ -4,6 +4,8 @@ from sqlalchemy import (
 )
 from config.db import meta_data, engine
 
+meta_data.clear()
+
 periodos = Table(
     "periodos",
     meta_data,
@@ -13,7 +15,7 @@ periodos = Table(
     Column("fecha_fin", DATE, nullable=False),
     Column(
         "estado",
-        Enum("activo", "inactivo", name="estado_periodo"),
+        Enum("activo", "cerrado", name="estado_periodo"),
         default="activo"
     ),
     extend_existing=True
