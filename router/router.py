@@ -10,11 +10,14 @@ from schema.faq_schema import Faq_Schema
 from models.faq import faq
 from models.usuarios import usuarios
 from services.embedding_service import buscar_faq
-from services.chat_service import procesar_mensaje
-from graph.service import chat_sai
+
 
 import os
 import httpx
+
+
+from mcp.memory_client import MemoryClient
+memory = MemoryClient("http://localhost:5005")
 
 
 user = APIRouter()
@@ -31,6 +34,8 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessag
 
 
 chatwoot_conversations = {}
+
+
 
 
 @user.get("/")
@@ -55,6 +60,12 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     answer: str
+    
+class ChatLoginRequest(BaseModel):
+    id_usuario: int
+    id_estudiante: int | None = None  
+    
+    
 
 def serialize_messages(messages):
     serialized = []
@@ -76,33 +87,56 @@ def get_test_usuarios(db: Session = Depends(get_db)):
         "usuarios": [dict(row._mapping) for row in result]
     }
 
+
+@user.post("/iniciar_chat")
+async def iniciar_chat_endpoint(request: ChatLoginRequest):
+    """
+    Inicializa la sesión del usuario en el servidor de memoria.
+    """
+    user_id = request.id_usuario
+    id_estudiante = request.id_estudiante
+
+    await memory.write(user_id, {
+        "id_usuario": user_id,
+        "id_estudiante": id_estudiante,
+        "rol": "estudiante"
+    })
+
+    return {
+        "message": "Sesión iniciada correctamente",
+        "id_usuario": user_id,
+        "id_estudiante": id_estudiante
+    }
+
+
+
+
 @chat.post("/chat", response_model=ChatResponse)
 def chat_endpoint(payload: ChatRequest):
-    try:
-        state = {
-            "messages": [{"role": "user", "content": payload.message}],
-            "intent": "general",
-            "context": "",
-        }
+    user_id = payload.session_id 
+    state = {
+        "messages": [{"role": "user", "content": payload.message}],
+        "intent": "general",
+        "context": "",
+        "thread_id": str(user_id)
+    }
 
-        result = graph.invoke(
-            state,
-            config={
-                "configurable": {
-                    "thread_id": payload.session_id  
-                }
+    result = graph.invoke(
+        state,
+        config={
+            "configurable": {
+                "thread_id": str(user_id)  
             }
-        )
+        }
+    )
 
-        messages = result.get("messages", [])
-        if not messages:
-            return {"answer": "No se pudo generar respuesta."}
+    messages = result.get("messages", [])
+    answer = messages[-1].content if messages else "No se pudo generar respuesta."
+    return {"answer": answer}
 
-        answer = messages[-1].content
-        return {"answer": answer}
 
-    except Exception as e:
-        return {"answer": "Error interno del servidor."}
+
+
 
 
 async def enviar_mensaje_telegram(chat_id: str, texto: str):
@@ -154,11 +188,12 @@ async def telegram_webhook(payload: dict):
     state = {
         "messages": [{"role": "user", "content": user_message}],
         "intent": "general",
-        "context": ""
+        "context": "",
+        "thread_id": str(chat_id)
     }
 
     
-    result = graph.invoke(
+    result = await graph.ainvoke(
         state,
         config={
             "configurable": {"thread_id": str(chat_id)}

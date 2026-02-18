@@ -3,21 +3,22 @@ from sqlalchemy import text
 from config.db import engine
 
 @tool
-def registrar_matricula(id_usuario: int, id_grupo: int) -> str:
+def registrar_matricula(id_estudiante: int, id_grupo: int) -> str:
     """
-    Registra una matrícula en la base de datos.
+    Registra una matrícula o cambia de grupo si ya existe.
     """
 
     try:
         with engine.begin() as conn:
 
+            
             estudiante = conn.execute(
-                text("SELECT id FROM estudiantes WHERE id_usuario = :uid"),
-                {"uid": id_usuario}
+                text("SELECT id FROM estudiantes WHERE id = :eid"),
+                {"eid": id_estudiante}
             ).fetchone()
 
             if not estudiante:
-                return f"No se encontró un estudiante con id_usuario {id_usuario}"
+                return f"No se encontró un estudiante con id {id_estudiante}"
 
             id_estudiante = estudiante[0]
 
@@ -29,21 +30,37 @@ def registrar_matricula(id_usuario: int, id_grupo: int) -> str:
             if not grupo:
                 return f"No existe un grupo con id {id_grupo}"
 
-            existe = conn.execute(
+            
+            matricula_actual = conn.execute(
                 text("""
-                    SELECT id FROM matriculas
+                    SELECT id, id_grupo FROM matriculas
                     WHERE id_estudiante = :id_est
-                    AND id_grupo = :id_grupo
                 """),
-                {
-                    "id_est": id_estudiante,
-                    "id_grupo": id_grupo
-                }
+                {"id_est": id_estudiante}
             ).fetchone()
 
-            if existe:
-                return "El estudiante ya está matriculado en este grupo."
+            if matricula_actual:
 
+               
+                if matricula_actual[1] == id_grupo:
+                    return "El estudiante ya está en ese grupo."
+
+                
+                conn.execute(
+                    text("""
+                        UPDATE matriculas
+                        SET id_grupo = :id_grupo
+                        WHERE id_estudiante = :id_est
+                    """),
+                    {
+                        "id_est": id_estudiante,
+                        "id_grupo": id_grupo
+                    }
+                )
+
+                return "Grupo actualizado correctamente."
+
+            
             conn.execute(
                 text("""
                     INSERT INTO matriculas (id_estudiante, id_grupo)

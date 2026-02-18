@@ -1,30 +1,26 @@
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.checkpoint.memory import MemorySaver
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolNode
-from sqlalchemy import text
-from config.db import engine
+
+from mcp.memory_client import MemoryClient
+from langgraph.checkpoint.memory import MemorySaver
+
 from typing import Literal, Annotated, Optional
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
-from mcp.registry import tools
-from langgraph.prebuilt import ToolNode
+from tools.registry import tools
+
 import smtplib
 from email.mime.text import MIMEText
 import os
-import re
 
 from rag.search import buscar_faq
-from services.db_service import (
-    
-    obtener_docentes,
-    obtener_estudiantes,
-)
 
 load_dotenv()
 
+memory_saver = MemorySaver()
 
 
 class State(TypedDict, total=False):
@@ -39,16 +35,17 @@ class State(TypedDict, total=False):
     ]
     context: str
     human_escalated: bool
-    flow_step: Optional[str]
-    collected_data: dict
+    user_id: Optional[int]
+    thread_id: Optional[str]
 
 
 
 llm = ChatOpenAI(
     model="gpt-4o-mini",
-    temperature=0.5
+    temperature=0.3
 ).bind_tools(tools)
 
+memory = MemoryClient("http://localhost:5005")
 
 
 
@@ -57,58 +54,54 @@ def get_last_message_content(state: State):
     return last["content"] if isinstance(last, dict) else last.content
 
 
-def generar_resumen_conversacion(state: State) -> str:
-    mensajes = []
-    for m in state["messages"]:
-        mensajes.append(m["content"] if isinstance(m, dict) else m.content)
-
-    prompt = f"""
-    Resume brevemente la siguiente conversación:
-
-    {mensajes}
-    """
-    return llm.invoke(prompt).content.strip()
 
 
-def enviar_correo_escalamiento(state: State):
-    resumen = generar_resumen_conversacion(state)
+async def verificar_sesion(state: State):
+    thread_id = state.get("thread_id")
 
-    cuerpo = f"""
-Se solicitó atención humana.
+    if not thread_id:
+        return {
+            "messages": [{
+                "role": "assistant",
+                "content": "Error de sesión."
+            }],
+            "intent": "silencio"
+        }
 
-Resumen:
-------------------
-{resumen}
-------------------
-"""
+    try:
+        memory_data = await memory.read(thread_id)
+    except Exception as e:
+        print("Error leyendo memoria:", e)
+        return {}
 
-    msg = MIMEText(cuerpo)
-    msg["Subject"] = "Caso escalado - SAI"
-    msg["From"] = os.getenv("SMTP_EMAIL")
-    msg["To"] = os.getenv("DESTINO_SOPORTE")
+    if isinstance(memory_data, dict):
+        user_id = memory_data.get("id_usuario")
+        if user_id:
+            return {"user_id": user_id}
 
-    with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT"))) as server:
-        server.starttls()
-        server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
-        server.send_message(msg)
+    return {}
+
+
+
+
+def decidir_despues_sesion(state: State):
+    return "router"
 
 
 
 
 def router(state: State):
 
-    if state.get("humano_escalado"):
+    if state.get("human_escalated"):
         return {"intent": "silencio"}
 
     mensaje = get_last_message_content(state).lower()
 
-    palabras_humano = ["asesor", "humano", "persona real", "agente"]
-
-    if any(p in mensaje for p in palabras_humano):
+    if any(p in mensaje for p in ["asesor", "humano", "agente"]):
         return {"intent": "human"}
 
     prompt = f"""
-Clasifica la intención del usuario:
+Clasifica la intención del usuario en UNA sola palabra:
 
 - human
 - matricula
@@ -121,9 +114,7 @@ Mensaje: {mensaje}
 
     intent = llm.invoke(prompt).content.strip().lower()
 
-    valid = ["human", "matricula", "buscar_correo", "faq", "general"]
-
-    if intent not in valid:
+    if intent not in ["human", "matricula", "buscar_correo", "faq", "general"]:
         intent = "general"
 
     return {"intent": intent}
@@ -132,13 +123,26 @@ Mensaje: {mensaje}
 
 
 def escalamiento_humano(state: State):
-    enviar_correo_escalamiento(state)
+
+    msg = MIMEText("Se solicitó atención humana.")
+    msg["Subject"] = "Caso escalado - SAI"
+    msg["From"] = os.getenv("SMTP_EMAIL")
+    msg["To"] = os.getenv("DESTINO_SOPORTE")
+
+    try:
+        with smtplib.SMTP(os.getenv("SMTP_HOST"), int(os.getenv("SMTP_PORT"))) as server:
+            server.starttls()
+            server.login(os.getenv("SMTP_EMAIL"), os.getenv("SMTP_PASSWORD"))
+            server.send_message(msg)
+    except:
+        pass
+
     return {
         "messages": [{
             "role": "assistant",
             "content": "He notificado a un asesor humano. En breve continuará contigo."
         }],
-        "humano_escalado": True
+        "human_escalated": True
     }
 
 
@@ -146,38 +150,55 @@ def silencio(state: State):
     return {"messages": []}
 
 
-def chat_general(state):
+
+
+def rag_faq(state: State):
+    question = get_last_message_content(state)
+    context = buscar_faq(question)
+    if not context:
+        context = "No encontré información en preguntas frecuentes."
+    return {"context": context}
+
+
+def faq_response(state: State):
+    system_prompt = f"Responde usando solo esta información:\n\n{state.get('context')}"
+    response = llm.invoke([("system", system_prompt)] + state["messages"])
+    return {"messages": [response]}
+
+
+
+
+def chat_general(state: State):
+
     system_prompt = """
 Eres un asistente del Sistema Académico Integral (SAI).
 
-Reglas importantes:
+Reglas IMPORTANTES:
 
-- Si el usuario quiere consultar su matrícula o correo electrónico pero NO ha proporcionado
-  su id_usuario, debes pedirlo antes de llamar la herramienta.
-
-- Solo debes llamar las herramientas cuando tengas los datos necesarios.
-- Si falta información, primero solicítala de forma clara y amable.
-
-- Si el usuario pregunta cómo matricularse:
+- Si el usuario quiere matricularse:
   1. Explica el proceso.
-  2. Ofrece realizar la inscripción desde el chat.
-  3. Si acepta, usa la herramienta registrar_matricula.
+  2. Pregunta si desea continuar.
+  3. Si responde afirmativamente (sí, claro, ok, continuar, etc.),
+     llama la herramienta registrar_matricula.
 
-Mantén tono profesional.
-No inventes información.
+- Si quiere consultar notas o correo:
+  Usa el user_id si está disponible.
+  Llama la herramienta correspondiente.
+
+- Solo llama herramientas cuando tengas todos los datos.
+- Si falta información, solicítala primero.
+- No inventes datos.
+- Mantén continuidad en la conversación.
 """
 
     messages = state["messages"]
 
-   
     if not any(isinstance(m, SystemMessage) for m in messages):
         messages = [SystemMessage(content=system_prompt)] + messages
 
     response = llm.invoke(messages)
 
     return {"messages": [response]}
-
-
 
 
 def should_continue(state):
@@ -189,39 +210,12 @@ def should_continue(state):
     return "end"
 
 
-def rag_faq(state: State):
-    question = get_last_message_content(state)
-    context = buscar_faq(question)
-
-    if not context:
-        context = "No encontré información en preguntas frecuentes."
-
-    return {"context": context}
-
-
-def faq_response(state: State):
-
-    system_prompt = f"""
-Responde usando solo esta información:
-
-{state.get('context')}
-"""
-
-    response = llm.invoke(
-        [("system", system_prompt)] + state["messages"]
-    )
-
-    return {"messages": [response]}
-
-
-
-
-
 tool_node = ToolNode(tools)
 
 
 builder = StateGraph(State)
 
+builder.add_node("verificar_sesion", verificar_sesion)
 builder.add_node("router", router)
 builder.add_node("escalamiento_humano", escalamiento_humano)
 builder.add_node("chat_general", chat_general)
@@ -230,7 +224,16 @@ builder.add_node("rag_faq", rag_faq)
 builder.add_node("faq_response", faq_response)
 builder.add_node("silencio", silencio)
 
-builder.add_edge(START, "router")
+
+builder.add_edge(START, "verificar_sesion")
+
+builder.add_conditional_edges(
+    "verificar_sesion",
+    decidir_despues_sesion,
+    {
+        "router": "router"
+    }
+)
 
 builder.add_conditional_edges(
     "router",
@@ -246,9 +249,10 @@ builder.add_conditional_edges(
 )
 
 builder.add_edge("rag_faq", "faq_response")
-
 builder.add_edge("faq_response", END)
+
 builder.add_edge("tools", "chat_general")
+
 builder.add_conditional_edges(
     "chat_general",
     should_continue,
@@ -258,10 +262,9 @@ builder.add_conditional_edges(
     },
 )
 
-
-
 builder.add_edge("escalamiento_humano", END)
 builder.add_edge("silencio", END)
 
-memory = MemorySaver()
-graph = builder.compile(checkpointer=memory)
+graph = builder.compile(
+    checkpointer=memory_saver
+)

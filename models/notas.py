@@ -11,7 +11,7 @@ notas = Table(
     "notas",
     meta_data,
     Column("id", Integer, primary_key=True, autoincrement=True),
-    Column("id_matricula", INT,ForeignKey("matricula.id"), nullable=False),
+    Column("id_matricula", INT,ForeignKey("matriculas.id"), nullable=False),
     Column("tipo_evaluacion", String(200), nullable=False),
     Column("nota", DECIMAL(2,3), nullable=False),
     extend_existing=True
