@@ -4,7 +4,7 @@ from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage
 from langgraph.prebuilt import ToolNode
 
-from mcp.memory_client import MemoryClient
+from mcp.memory_client import memory
 from langgraph.checkpoint.memory import MemorySaver
 
 from typing import Literal, Annotated, Optional
@@ -45,7 +45,7 @@ llm = ChatOpenAI(
     temperature=0.3
 ).bind_tools(tools)
 
-memory = MemoryClient("http://localhost:5005")
+
 
 
 

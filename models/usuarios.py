@@ -1,6 +1,6 @@
 from sqlalchemy import (
     Table, Column, Integer, String,
-    Enum, DateTime, ForeignKey, func
+    Enum, DateTime, INT, ForeignKey, func
 )
 from config.db import meta_data, engine
 
@@ -12,6 +12,7 @@ usuarios = Table(
     Column("email", String(120), nullable=False, unique=True),
     Column("password_hash", String(255), nullable=False),
     Column("id_rol", Integer, ForeignKey("roles.id"), nullable=False),
+    Column("telegram_id", INT, nullable=False),
     Column(
         "estado",
         Enum("activo", "inactivo", name="estado_usuario"),

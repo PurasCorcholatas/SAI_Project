@@ -10,13 +10,14 @@ from schema.faq_schema import Faq_Schema
 from models.faq import faq
 from models.usuarios import usuarios
 from services.embedding_service import buscar_faq
-
-
+from utils.pdf import descargar_pdf_telegram
+from mcp.memory_client import MemoryClient
+from models.documento_telegram import documentos_telegram
+from utils.text_splitter import dividir_en_chunks
 import os
 import httpx
+from utils.pdf_leer import extraer_texto_pdf
 
-
-from mcp.memory_client import MemoryClient
 memory = MemoryClient("http://localhost:5005")
 
 
@@ -32,10 +33,39 @@ API_TOKEN = os.getenv("CHATWOOT_API_TOKEN")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
 
-
 chatwoot_conversations = {}
 
 
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str
+
+class ChatResponse(BaseModel):
+    answer: str
+
+class ChatLoginRequest(BaseModel):
+    id_usuario: int
+    id_estudiante: int | None = None  
+
+
+def serialize_messages(messages):
+    serialized = []
+    for m in messages:
+        if isinstance(m, AIMessage):
+            serialized.append({"role": "ai", "content": m.content})
+        elif isinstance(m, dict):
+            serialized.append(m)
+        else:
+            serialized.append({"content": str(m)})
+    return serialized
+
+async def enviar_mensaje_telegram(chat_id: str, texto: str):
+    """Enviar mensaje al chat de Telegram"""
+    async with httpx.AsyncClient() as client:
+        await client.post(
+            TELEGRAM_API_URL,
+            json={"chat_id": chat_id, "text": texto}
+        )
 
 
 @user.get("/")
@@ -53,31 +83,6 @@ def faq_usuario(texto: str = Query(...)):
     respuesta = buscar_faq(texto)
     return {"usuario": texto, "respuesta": respuesta}
 
-
-class ChatRequest(BaseModel):
-    message: str
-    session_id: str
-
-class ChatResponse(BaseModel):
-    answer: str
-    
-class ChatLoginRequest(BaseModel):
-    id_usuario: int
-    id_estudiante: int | None = None  
-    
-    
-
-def serialize_messages(messages):
-    serialized = []
-    for m in messages:
-        if isinstance(m, AIMessage):
-            serialized.append({"role": "ai", "content": m.content})
-        elif isinstance(m, dict):
-            serialized.append(m)
-        else:
-            serialized.append({"content": str(m)})
-    return serialized
-
 @test_usuarios.get("/test/usuarios")
 def get_test_usuarios(db: Session = Depends(get_db)):
     stmt = select(usuarios)
@@ -87,12 +92,9 @@ def get_test_usuarios(db: Session = Depends(get_db)):
         "usuarios": [dict(row._mapping) for row in result]
     }
 
-
 @user.post("/iniciar_chat")
 async def iniciar_chat_endpoint(request: ChatLoginRequest):
-    """
-    Inicializa la sesión del usuario en el servidor de memoria.
-    """
+    """Inicializa la sesión del usuario en el servidor de memoria."""
     user_id = request.id_usuario
     id_estudiante = request.id_estudiante
 
@@ -109,25 +111,18 @@ async def iniciar_chat_endpoint(request: ChatLoginRequest):
     }
 
 
-
-
 @chat.post("/chat", response_model=ChatResponse)
 def chat_endpoint(payload: ChatRequest):
-    user_id = payload.session_id 
+    user_id = payload.session_id
     state = {
         "messages": [{"role": "user", "content": payload.message}],
         "intent": "general",
         "context": "",
-        "thread_id": str(user_id)
     }
 
     result = graph.invoke(
         state,
-        config={
-            "configurable": {
-                "thread_id": str(user_id)  
-            }
-        }
+        config={"configurable": {"thread_id": str(user_id)}}
     )
 
     messages = result.get("messages", [])
@@ -135,113 +130,116 @@ def chat_endpoint(payload: ChatRequest):
     return {"answer": answer}
 
 
-
-
-
-
-async def enviar_mensaje_telegram(chat_id: str, texto: str):
-    """Enviar mensaje al chat de Telegram"""
-    async with httpx.AsyncClient() as client:
-        await client.post(
-            TELEGRAM_API_URL,
-            json={
-                "chat_id": chat_id,
-                "text": texto
-            }
-        )
-
-
-async def obtener_conversation_id(chat_id: str):
-    """Devuelve el conversation_id de Chatwoot para un chat_id de Telegram.
-    Si no existe, lo crea."""
-    async with httpx.AsyncClient() as client:
-        if chat_id in chatwoot_conversations:
-            return chatwoot_conversations[chat_id]
-
-       
-        response = await client.post(
-            f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations",
-            headers={"api_access_token": API_TOKEN},
-            json={
-                "source_id": chat_id,  
-                "inbox_id": 1,  
-                "contact": {"name": f"Telegram_{chat_id}"}
-            }
-        )
-        data = response.json()
-        conversation_id = data.get("id")
-        chatwoot_conversations[chat_id] = conversation_id
-        return conversation_id
-
-
 @telegram_router.post("/telegram/webhook")
-async def telegram_webhook(payload: dict):
-    """Webhook para recibir mensajes de Telegram, responder con LangGraph y guardar todo en Chatwoot."""
+async def telegram_webhook(payload: dict, db: Session = Depends(get_db)):
+    """
+    Webhook para recibir mensajes de Telegram.
+    - Si es PDF → lo descarga y guarda en BD.
+    - Si es texto → lo envía a LangGraph y responde.
+    """
+
     message_data = payload.get("message")
     if not message_data:
         return {"status": "ignored"}
 
-    chat_id = message_data["chat"]["id"]
+    chat_id = str(message_data["chat"]["id"])
     user_message = message_data.get("text", "")
 
-    
-    state = {
-        "messages": [{"role": "user", "content": user_message}],
-        "intent": "general",
-        "context": "",
-        "thread_id": str(chat_id)
-    }
+    print("Mensaje recibido:", user_message)
 
     
-    result = await graph.ainvoke(
-        state,
-        config={
-            "configurable": {"thread_id": str(chat_id)}
+    query = usuarios.select().where(usuarios.c.telegram_id == chat_id)
+    usuario = db.execute(query).first()
+
+    
+    document = message_data.get("document")
+
+    if document and document.get("mime_type") == "application/pdf":
+
+        if not usuario:
+            await enviar_mensaje_telegram(
+                chat_id,
+                "Primero debes vincular tu cuenta."
+            )
+            return {"status": "no_linked"}
+
+        user_id_bd = usuario.id
+        file_id = document["file_id"]
+        file_name = document.get("file_name", "documento.pdf")
+
+        print(f"Descargando PDF: {file_name}")
+
+        archivo_local = await descargar_pdf_telegram(
+            file_id,
+            chat_id,
+            file_name
+        )
+
+        insert_query = documentos_telegram.insert().values(
+            id_usuario=user_id_bd,
+            nombre_original=file_name,
+            ruta_archivo=archivo_local,
+            mime_type=document.get("mime_type")
+        )
+
+        db.execute(insert_query)
+        db.commit()
+
+        await enviar_mensaje_telegram(
+            chat_id,
+            f" Documento '{file_name}' recibido y guardado correctamente."
+        )
+
+        texto_pdf = extraer_texto_pdf(archivo_local)
+
+        chunks = dividir_en_chunks(texto_pdf)
+
+        print(f"Total chunks generados: {len(chunks)}")
+        print("Primer chunk:")
+        print(chunks[0][:500])
+
+
+        
+        return {"status": "pdf_descargado"}
+
+    
+    if user_message:
+
+        if not usuario:
+            await enviar_mensaje_telegram(
+                chat_id,
+                "Primero debes vincular tu cuenta."
+            )
+            return {"status": "no_linked"}
+
+        print("Enviando mensaje a LangGraph...")
+
+        state = {
+            "messages": [{"role": "user", "content": user_message}],
+            "intent": "general",
+            "context": "",
+            "user_id": usuario.id
         }
-    )
 
-    messages = result.get("messages", [])
-    bot_response = messages[-1].content if messages else "No se pudo generar respuesta."
+        result = await graph.ainvoke(
+            state,
+            config={"configurable": {"thread_id": chat_id}}
+        )
 
-    
-    await enviar_mensaje_telegram(chat_id, bot_response)
+        messages = result.get("messages", [])
+        bot_response = (
+            messages[-1].content
+            if messages
+            else "No se pudo generar respuesta."
+        )
 
-    
-    try:
-        async with httpx.AsyncClient() as client:
-            
-            if chat_id not in chatwoot_conversations:
-                response = await client.post(
-                    f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations",
-                    headers={"api_access_token": API_TOKEN},
-                    json={
-                        "source_id": chat_id,
-                        "inbox_id": 1,  
-                        "contact": {"name": f"Telegram_{chat_id}"}
-                    }
-                )
-                data = response.json()
-                conversation_id = data.get("id")
-                chatwoot_conversations[chat_id] = conversation_id
-            else:
-                conversation_id = chatwoot_conversations[chat_id]
+        print("Respuesta generada:", bot_response)
 
-            
-            await client.post(
-                f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages",
-                headers={"api_access_token": API_TOKEN},
-                json={"content": user_message, "message_type": "incoming"}
-            )
+        await enviar_mensaje_telegram(chat_id, bot_response)
 
-            
-            await client.post(
-                f"{CHATWOOT_URL}/api/v1/accounts/{ACCOUNT_ID}/conversations/{conversation_id}/messages",
-                headers={"api_access_token": API_TOKEN},
-                json={"content": bot_response, "message_type": "outgoing"}
-            )
+        return {"status": "ok"}
 
-    except Exception as e:
-        print("Error sincronizando con Chatwoot:", e)
+    return {"status": "no_text_or_document"}
 
-    return {"status": "ok"}
+
 
