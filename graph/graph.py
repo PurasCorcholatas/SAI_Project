@@ -16,45 +16,43 @@ import smtplib
 from email.mime.text import MIMEText
 import os
 
-from rag.search import buscar_faq
+from vectorstore.vector_service import buscar_faq
+from vectorstore.vector_service import buscar_en_documentos_usuario
 
 load_dotenv()
 
 memory_saver = MemorySaver()
-
 
 class State(TypedDict, total=False):
     messages: Annotated[list, add_messages]
     intent: Literal[
         "general",
         "faq",
+        "documento",
         "human",
         "matricula",
         "buscar_correo",
         "silencio"
     ]
-    context: str
+    context: Optional[str]
     human_escalated: bool
     user_id: Optional[int]
     thread_id: Optional[str]
+    next_node: Optional[str]
 
-
+classifier_llm = ChatOpenAI(
+    model="gpt-4.1",
+    temperature=0
+)
 
 llm = ChatOpenAI(
-    model="gpt-4o-mini",
+    model="gpt-4.1",
     temperature=0.3
 ).bind_tools(tools)
-
-
-
-
 
 def get_last_message_content(state: State):
     last = state["messages"][-1]
     return last["content"] if isinstance(last, dict) else last.content
-
-
-
 
 async def verificar_sesion(state: State):
     thread_id = state.get("thread_id")
@@ -70,8 +68,7 @@ async def verificar_sesion(state: State):
 
     try:
         memory_data = await memory.read(thread_id)
-    except Exception as e:
-        print("Error leyendo memoria:", e)
+    except:
         return {}
 
     if isinstance(memory_data, dict):
@@ -81,46 +78,50 @@ async def verificar_sesion(state: State):
 
     return {}
 
-
-
-
 def decidir_despues_sesion(state: State):
     return "router"
-
-
-
 
 def router(state: State):
 
     if state.get("human_escalated"):
         return {"intent": "silencio"}
 
-    mensaje = get_last_message_content(state).lower()
-
-    if any(p in mensaje for p in ["asesor", "humano", "agente"]):
-        return {"intent": "human"}
+    history = state["messages"][-3:]
+    conversation = "\n".join(
+        [m["content"] if isinstance(m, dict) else m.content for m in history]
+    )
 
     prompt = f"""
-Clasifica la intención del usuario en UNA sola palabra:
+Eres un clasificador determinista.
+Clasifica la intención del ÚLTIMO mensaje del usuario considerando el contexto.
 
-- human
-- matricula
-- buscar_correo
-- faq
-- general
+Contexto:
+"{conversation}"
 
-Mensaje: {mensaje}
+Reglas:
+- Si menciona documento, archivo, pdf, texto cargado -> documento
+- Si habla de matricularse -> matricula
+- Si pide humano -> human
+- Si consulta notas/correo personal -> buscar_correo
+- Si pregunta sobre el sistema -> faq
+- En cualquier otro caso -> general
+
+Responde SOLO una palabra.
 """
 
-    intent = llm.invoke(prompt).content.strip().lower()
+    raw_intent = classifier_llm.invoke(prompt).content.strip().lower()
+    intent = raw_intent.split()[0].replace(".", "")
 
-    if intent not in ["human", "matricula", "buscar_correo", "faq", "general"]:
+    valid = ["human","matricula","buscar_correo","faq","documento","general"]
+
+    print("intent:", intent)
+    
+    if intent not in valid:
         intent = "general"
 
+    
     return {"intent": intent}
-
-
-
+    
 
 def escalamiento_humano(state: State):
 
@@ -145,61 +146,130 @@ def escalamiento_humano(state: State):
         "human_escalated": True
     }
 
-
 def silencio(state: State):
     return {"messages": []}
-
-
-
 
 def rag_faq(state: State):
     question = get_last_message_content(state)
     context = buscar_faq(question)
+
     if not context:
         context = "No encontré información en preguntas frecuentes."
+
     return {"context": context}
 
-
 def faq_response(state: State):
-    system_prompt = f"Responde usando solo esta información:\n\n{state.get('context')}"
-    response = llm.invoke([("system", system_prompt)] + state["messages"])
+
+    system_prompt = f"""
+Responde SOLO usando esta información:
+
+{state.get('context')}
+
+Si no está en el contexto, di que no tienes información.
+"""
+
+    response = llm.invoke([
+        ("system", system_prompt),
+        ("human", get_last_message_content(state))
+    ])
+
     return {"messages": [response]}
 
+def rag_documento(state: State):
+    
+    question = get_last_message_content(state)
+    user_id = state.get("user_id")
+    print("User_id:", user_id)
+
+    if not user_id:
+        return {
+            "context": "",
+            "next_node": "chat_general"
+        }
+
+    docs = buscar_en_documentos_usuario(
+        user_id=user_id,
+        query=question,
+        k=8
+    )
+
+    if not docs:
+        return {
+            "context": "",
+            "next_node": "chat_general"
+        }
+
+    contexto = "\n\n".join([doc.page_content for doc in docs[:4]])
+    print("User_id:", user_id)
+    print("Docs encontrados:", len(docs))
+    print("Primer chunk:", docs[0].page_content if docs else "NADA")
+    print("RAG se ejecuto")
+    print("Contexto")
+
+    return {
+        "context": contexto,
+        "next_node": "documento_response"
+    }
+    
 
 
+def documento_response(state: State):
+    question = get_last_message_content(state)
+    context = state.get("context", "")
+
+    print("Contexto:", len(context))
+    print("Muestra del contexto:", context[:200] if context else "VACIO")
+
+ 
+    
+    if not context.strip():
+        return {
+            "messages": [{
+                "role": "assistant",
+                "content": "No encontré información suficiente en el documento."
+            }]
+        }
+
+    system_prompt = f"""
+Eres un asistente experto en análisis de documentos.
+
+Responde usando la información del contexto.
+No inventes información que no esté relacionada.
+
+Si encuentras información parcialmente relacionada,
+úsala para construir la mejor respuesta posible.
+
+Solo responde "No encontré información suficiente en el documento."
+si absolutamente nada del contexto está relacionado.
+
+Contexto:
+{context}
+"""
+
+    response = llm.invoke([
+        ("system", system_prompt),
+        ("human", question)
+    ])
+
+    return {"messages": [response]}
 
 def chat_general(state: State):
 
     system_prompt = """
 Eres un asistente del Sistema Académico Integral (SAI).
-
-Reglas IMPORTANTES:
-
-- Si el usuario quiere matricularse:
-  1. Explica el proceso.
-  2. Pregunta si desea continuar.
-  3. Si responde afirmativamente (sí, claro, ok, continuar, etc.),
-     llama la herramienta registrar_matricula.
-
-- Si quiere consultar notas o correo:
-  Usa el user_id si está disponible.
-  Llama la herramienta correspondiente.
-
-- Solo llama herramientas cuando tengas todos los datos.
-- Si falta información, solicítala primero.
-- No inventes datos.
-- Mantén continuidad en la conversación.
+No inventes datos. Mantén continuidad.
 """
 
     messages = state["messages"]
 
+    
+    
     if not any(isinstance(m, SystemMessage) for m in messages):
         messages = [SystemMessage(content=system_prompt)] + messages
 
     response = llm.invoke(messages)
 
     return {"messages": [response]}
-
 
 def should_continue(state):
     last_message = state["messages"][-1]
@@ -209,9 +279,7 @@ def should_continue(state):
 
     return "end"
 
-
 tool_node = ToolNode(tools)
-
 
 builder = StateGraph(State)
 
@@ -221,18 +289,17 @@ builder.add_node("escalamiento_humano", escalamiento_humano)
 builder.add_node("chat_general", chat_general)
 builder.add_node("tools", tool_node)
 builder.add_node("rag_faq", rag_faq)
+builder.add_node("rag_documento", rag_documento)
+builder.add_node("documento_response", documento_response)
 builder.add_node("faq_response", faq_response)
 builder.add_node("silencio", silencio)
-
 
 builder.add_edge(START, "verificar_sesion")
 
 builder.add_conditional_edges(
     "verificar_sesion",
     decidir_despues_sesion,
-    {
-        "router": "router"
-    }
+    {"router": "router"}
 )
 
 builder.add_conditional_edges(
@@ -241,16 +308,25 @@ builder.add_conditional_edges(
     {
         "human": "escalamiento_humano",
         "faq": "rag_faq",
+        "documento": "rag_documento",
         "matricula": "chat_general",
-        "buscar_correo": "chat_general",
         "general": "chat_general",
         "silencio": "silencio"
     }
 )
 
+builder.add_conditional_edges(
+    "rag_documento",
+    lambda state: state.get("next_node"),
+    {
+        "documento_response": "documento_response",
+        "chat_general": "chat_general"
+    }
+)
+
+builder.add_edge("documento_response", END)
 builder.add_edge("rag_faq", "faq_response")
 builder.add_edge("faq_response", END)
-
 builder.add_edge("tools", "chat_general")
 
 builder.add_conditional_edges(
@@ -265,6 +341,4 @@ builder.add_conditional_edges(
 builder.add_edge("escalamiento_humano", END)
 builder.add_edge("silencio", END)
 
-graph = builder.compile(
-    checkpointer=memory_saver
-)
+graph = builder.compile(checkpointer=memory_saver)
